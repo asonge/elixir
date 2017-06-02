@@ -25,6 +25,8 @@ defmodule Mix.Tasks.Compile.Elixir do
       return a non-zero exit code
     * `--long-compilation-threshold N` - sets the "long compilation" threshold
       (in seconds) to `N` (see the docs for `Kernel.ParallelCompiler.files/2`)
+    * `--large-resource-threshold N` - sets the "large resource" threshold
+      (in bytes) to `N`. Skips the hashing step.
 
   ## Configuration
 
@@ -41,7 +43,8 @@ defmodule Mix.Tasks.Compile.Elixir do
 
   @switches [force: :boolean, docs: :boolean, warnings_as_errors: :boolean,
              ignore_module_conflict: :boolean, debug_info: :boolean,
-             verbose: :boolean, long_compilation_threshold: :integer]
+             verbose: :boolean, long_compilation_threshold: :integer,
+             large_resource_threshold: :integer]
 
   @doc """
   Runs this task.
