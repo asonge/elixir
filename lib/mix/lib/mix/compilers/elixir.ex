@@ -1,14 +1,14 @@
 defmodule Mix.Compilers.Elixir do
   @moduledoc false
 
-  @manifest_vsn :v6
+  @manifest_vsn :v7
 
   import Record
 
   defrecord :module, [:module, :kind, :sources, :beam, :binary]
   defrecord :source, [
     source: nil,
-    size: 0,
+    hash: nil,
     compile_references: [],
     runtime_references: [],
     compile_dispatches: [],
@@ -34,6 +34,10 @@ defmodule Mix.Compilers.Elixir do
     timestamp = :calendar.universal_time()
     all_paths = MapSet.new(Mix.Utils.extract_files(srcs, exts))
 
+    # 512KB is getting up there on hash sizes for source and external files
+    # If we have a lot of these, can slow compilation a lot.
+    {large_resource_threshold, opts} = Keyword.pop(opts, :large_resource_threshold, 262144)
+
     {all_modules, all_sources} = parse_manifest(manifest, dest)
     modified = Mix.Utils.last_modified(manifest)
     prev_paths =
@@ -44,13 +48,14 @@ defmodule Mix.Compilers.Elixir do
       |> MapSet.difference(all_paths)
       |> MapSet.to_list
 
+    hashes = hash_sources(all_sources, large_resource_threshold)
+
     changed =
       if force do
         # A config, path dependency or manifest has
         # changed, let's just compile everything
         MapSet.to_list(all_paths)
       else
-        sources_stats = mtimes_and_sizes(all_sources)
 
         # Otherwise let's start with the new sources
         new_paths =
@@ -59,10 +64,9 @@ defmodule Mix.Compilers.Elixir do
           |> MapSet.to_list
 
         # Plus the sources that have changed in disk
-        for(source(source: source, external: external, size: size) <- all_sources,
-            {last_mtime, last_size} = Map.fetch!(sources_stats, source),
-            times = Enum.map(external, &(sources_stats |> Map.fetch!(&1) |> elem(0))),
-            size != last_size or Mix.Utils.stale?([last_mtime | times], [modified]),
+        for(source(source: source, external: external, hash: last_hash) <- all_sources,
+            hash = get_lazy_hash(hashes, source),
+            is_stale?(last_hash, hash) or is_any_stale?(external, hashes),
             into: new_paths,
             do: source)
       end
@@ -76,11 +80,11 @@ defmodule Mix.Compilers.Elixir do
       )
 
     stale   = changed -- removed
-    sources = update_stale_sources(all_sources, removed, changed)
+    sources = update_stale_sources(all_sources, removed, changed, hashes)
 
     cond do
       stale != [] ->
-        compile_manifest(manifest, exts, modules, sources, stale, dest, timestamp, opts)
+        compile_manifest(manifest, exts, modules, sources, hashes, stale, dest, timestamp, opts)
       removed != [] ->
         write_manifest(manifest, modules, sources, dest, timestamp)
       true ->
@@ -90,12 +94,65 @@ defmodule Mix.Compilers.Elixir do
     {stale, removed}
   end
 
-  defp mtimes_and_sizes(sources) do
-    Enum.reduce(sources, %{}, fn source(source: source, external: external), map ->
-      Enum.reduce([source | external], map, fn file, map ->
-        Map.put_new_lazy(map, file, fn -> Mix.Utils.last_modified_and_size(file) end)
-      end)
+  defp is_any_stale?(prev_hashes, new_hashes) do
+    Enum.any?(prev_hashes, fn {path, prev_hash} -> is_stale?(prev_hash, get_lazy_hash(new_hashes, path)) end)
+  end
+
+  # last, current
+  # identical hashes are never stale
+  def is_stale?({hash,_,_},{hash,_,_}) when hash != nil, do: false
+  # Large files only have size and last modified.
+  # When size is the same and last run > this run, we're not stale
+  def is_stale?({_,size,last_lm},{nil,size,lm}) when last_lm >= lm, do: false
+  # If we can't hit a resource for some reason, and that reason is the same, it's stale.
+  def is_stale?({:error, reason}, {:error, reason}), do: false
+  # All other scenarios: we're not stale
+  def is_stale?(_,_), do: true
+
+  defp get_lazy_hash({large_resource_threshold, map}, file) do
+    case Map.fetch(map, file) do
+      {:ok, bin_or_nil} -> bin_or_nil
+      :error -> hash(file, large_resource_threshold)
+    end
+  end
+
+  defp hash(path, large_resource_threshold) do
+    now = :calendar.universal_time()
+    case File.stat(path) do
+      {:ok, %File.Stat{size: size, mtime: mtime}} ->
+        cond do
+          mtime > now ->
+            Mix.shell.error("warning: mtime (modified time) for \"#{path}\" was set to the future, resetting to now")
+            File.touch!(path, now)
+          true ->
+            now
+        end
+        hash = if size <= large_resource_threshold and large_resource_threshold > 0 do
+          File.stream!(path, [:raw, :read_ahead, :binary, :read], 4096)
+          |> Enum.reduce(:crypto.hash_init(:sha512), fn input,ctx ->
+            :crypto.hash_update(ctx,input)
+          end)
+          |> :crypto.hash_final()
+        end
+        {hash, size, mtime}
+      {:error, reason} ->
+        {:error, reason}
+    end
+  end
+
+  defp hash_sources(sources, large_resource_threshold) do
+    source_hashes = Enum.reduce(sources, %{}, fn source(source: source, external: external), map ->
+      Enum.reduce(external, map, fn {file, _old_hash}, map ->
+        put_new_lazy_hash(map, file, large_resource_threshold)
+      end) |> put_new_lazy_hash(source, large_resource_threshold)
     end)
+    {large_resource_threshold, source_hashes}
+  end
+  defp put_new_lazy_hash(map, file, large_resource_threshold) do
+    case Map.has_key?(map, file) do
+      true -> map
+      false -> Map.put_new(map, file, hash(file, large_resource_threshold))
+    end
   end
 
   @doc """
@@ -135,7 +192,7 @@ defmodule Mix.Compilers.Elixir do
     end
   end
 
-  defp compile_manifest(manifest, exts, modules, sources, stale, dest, timestamp, opts) do
+  defp compile_manifest(manifest, exts, modules, sources, hashes, stale, dest, timestamp, opts) do
     Mix.Utils.compiling_n(length(stale), hd(exts))
     Mix.Project.ensure_structure()
     true = Code.prepend_path(dest)
@@ -156,7 +213,7 @@ defmodule Mix.Compilers.Elixir do
 
     try do
       _ = Kernel.ParallelCompiler.files stale,
-            [each_module: &each_module(pid, cwd, &1, &2, &3),
+            [each_module: &each_module(pid, cwd, hashes, &1, &2, &3),
              each_long_compilation: &each_long_compilation(&1, long_compilation_threshold),
              long_compilation_threshold: long_compilation_threshold,
              dest: dest] ++ extra
@@ -177,7 +234,7 @@ defmodule Mix.Compilers.Elixir do
     |> Code.compiler_options()
   end
 
-  defp each_module(pid, cwd, source, module, binary) do
+  defp each_module(pid, cwd, hashes, source, module, binary) do
     {compile_references, runtime_references} = Kernel.LexicalTracker.remote_references(module)
 
     compile_references =
@@ -201,7 +258,7 @@ defmodule Mix.Compilers.Elixir do
 
     kind     = detect_kind(module)
     source   = Path.relative_to(source, cwd)
-    external = get_external_resources(module, cwd)
+    external = get_external_resources(module, cwd) |> Enum.map(&{&1, get_lazy_hash(hashes, &1)})
 
     Agent.cast pid, fn {modules, sources} ->
       source_external = case List.keyfind(sources, source, source(:source)) do
@@ -224,7 +281,7 @@ defmodule Mix.Compilers.Elixir do
 
       new_source = source(
         source: source,
-        size: :filelib.file_size(source),
+        hash: get_lazy_hash(hashes, source),
         compile_references: compile_references,
         runtime_references: runtime_references,
         compile_dispatches: compile_dispatches,
@@ -266,13 +323,13 @@ defmodule Mix.Compilers.Elixir do
 
   ## Resolution
 
-  defp update_stale_sources(sources, removed, changed) do
+  defp update_stale_sources(sources, removed, changed, hashes) do
     # Remove delete sources
     sources =
       Enum.reduce(removed, sources, &List.keydelete(&2, &1, source(:source)))
     # Store empty sources for the changed ones as the compiler appends data
     sources =
-      Enum.reduce(changed, sources, &List.keystore(&2, &1, source(:source), source(source: &1)))
+      Enum.reduce(changed, sources, &List.keystore(&2, &1, source(:source), source(source: &1, hash: get_lazy_hash(hashes, &1))))
     sources
   end
 

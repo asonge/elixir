@@ -108,9 +108,9 @@ defmodule Mix.Tasks.Compile.ElixirTest do
     end
   end
 
-  test "compiles mtime changed files" do
+  test "compiles mtime changed files when hashing is disabled" do
     in_fixture "no_mixfile", fn ->
-      assert Mix.Tasks.Compile.Elixir.run(["--verbose"]) == :ok
+      assert Mix.Tasks.Compile.Elixir.run(["--verbose","--large-resource-threshold","0"]) == :ok
       assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
       assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
 
@@ -119,7 +119,7 @@ defmodule Mix.Tasks.Compile.ElixirTest do
 
       future = {{2020, 1, 1}, {0, 0, 0}}
       File.touch!("lib/a.ex", future)
-      Mix.Tasks.Compile.Elixir.run ["--verbose"]
+      Mix.Tasks.Compile.Elixir.run ["--verbose","--large-resource-threshold","0"]
 
       assert_received {:mix_shell, :error, ["warning: mtime (modified time) for \"lib/a.ex\" was set to the future, resetting to now"]}
       refute_received {:mix_shell, :error, ["warning: mtime (modified time) for \"lib/b.ex\" was set to the future, resetting to now"]}
@@ -128,7 +128,28 @@ defmodule Mix.Tasks.Compile.ElixirTest do
       refute_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
 
       File.touch!("_build/dev/lib/sample/.compile.elixir", future)
-      assert Mix.Tasks.Compile.Elixir.run([]) == :noop
+      assert Mix.Tasks.Compile.Elixir.run(["--large-resource-threshold","0"]) == :noop
+    end
+  end
+
+  test "compiles changed files" do
+    in_fixture "no_mixfile", fn ->
+      past = {{2010, 1, 1}, {0, 0, 0}}
+      File.touch!("lib/a.ex", past)
+
+      assert Mix.Tasks.Compile.Elixir.run(["--verbose"]) == :ok
+      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+      assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+
+      Mix.shell.flush
+      purge [A, B]
+
+      File.write!("lib/a.ex", File.read!("lib/a.ex") |> String.replace(" A "," C "))
+      File.touch!("lib/a.ex", past)
+      Mix.Tasks.Compile.Elixir.run ["--verbose"]
+
+      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+      refute_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
     end
   end
 
@@ -153,11 +174,27 @@ defmodule Mix.Tasks.Compile.ElixirTest do
     end
   end
 
-  test "compiles dependent changed modules" do
+  test "compiles dependent changed modules by content" do
     in_fixture "no_mixfile", fn ->
       File.write!("lib/a.ex", "defmodule A, do: B.module_info")
 
       assert Mix.Tasks.Compile.Elixir.run(["--verbose"]) == :ok
+      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+      assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+
+      File.write!("lib/b.ex", "\n# Hash buster comment", [:append])
+      Mix.Tasks.Compile.Elixir.run ["--verbose"]
+
+      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+      assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+    end
+  end
+
+  test "compiles dependent changed modules by time" do
+    in_fixture "no_mixfile", fn ->
+      File.write!("lib/a.ex", "defmodule A, do: B.module_info")
+
+      assert Mix.Tasks.Compile.Elixir.run(["--verbose","--large-resource-threshold","0"]) == :ok
       assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
       assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
 
@@ -166,7 +203,7 @@ defmodule Mix.Tasks.Compile.ElixirTest do
 
       future = {{2020, 1, 1}, {0, 0, 0}}
       File.touch!("lib/b.ex", future)
-      Mix.Tasks.Compile.Elixir.run ["--verbose"]
+      Mix.Tasks.Compile.Elixir.run(["--verbose","--large-resource-threshold","0"])
 
       assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
       assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
@@ -193,7 +230,48 @@ defmodule Mix.Tasks.Compile.ElixirTest do
     end
   end
 
-  test "compiles dependent changed files" do
+  test "compiles dependent changed files by time" do
+    in_fixture "no_mixfile", fn ->
+      tmp = tmp_path("c.eex")
+      File.touch!("lib/a.eex")
+
+      File.write!("lib/a.ex", """
+      defmodule A do
+        @external_resource "lib/a.eex"
+        @external_resource #{inspect tmp}
+        def a, do: :ok
+      end
+      """)
+
+      # Compiles with missing external resources
+      assert Mix.Tasks.Compile.Elixir.run(["--verbose","--large-resource-threshold","0"]) == :ok
+      assert Mix.Tasks.Compile.Elixir.run(["--verbose","--large-resource-threshold","0"]) == :noop
+      Mix.shell.flush
+      purge [A, B]
+
+      # Update local existing resource
+      File.touch!("lib/a.eex", {{2020, 1, 1}, {0, 0, 0}})
+      assert Mix.Tasks.Compile.Elixir.run(["--verbose","--large-resource-threshold","0"]) == :ok
+      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+      refute_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+
+      # Does not update on old existing resource
+      File.touch!("lib/a.eex", {{1970, 1, 1}, {0, 0, 0}})
+      assert Mix.Tasks.Compile.Elixir.run(["--verbose","--large-resource-threshold","0"]) == :noop
+      Mix.shell.flush
+      purge [A, B]
+
+      # Update external existing resource
+      File.touch!(tmp, {{2020, 1, 1}, {0, 0, 0}})
+      assert Mix.Tasks.Compile.Elixir.run(["--verbose","--large-resource-threshold","0"]) == :ok
+      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+      refute_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+    end
+  after
+    File.rm tmp_path("c.eex")
+  end
+
+  test "compiles dependent changed files by content" do
     in_fixture "no_mixfile", fn ->
       tmp = tmp_path("c.eex")
       File.touch!("lib/a.eex")
@@ -213,13 +291,12 @@ defmodule Mix.Tasks.Compile.ElixirTest do
       purge [A, B]
 
       # Update local existing resource
-      File.touch!("lib/a.eex", {{2020, 1, 1}, {0, 0, 0}})
+      File.write!("lib/a.eex", "\n# Hash buster comment", [:append])
       assert Mix.Tasks.Compile.Elixir.run(["--verbose"]) == :ok
       assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
       refute_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
 
       # Does not update on old existing resource
-      File.touch!("lib/a.eex", {{1970, 1, 1}, {0, 0, 0}})
       assert Mix.Tasks.Compile.Elixir.run(["--verbose"]) == :noop
       Mix.shell.flush
       purge [A, B]
@@ -308,7 +385,7 @@ defmodule Mix.Tasks.Compile.ElixirTest do
     end
   end
 
-  test "does not treat remote typespecs as compile time dependencies" do
+  test "does not treat remote typespecs as compile time dependencies based on content" do
     in_fixture "no_mixfile", fn ->
       File.write!("lib/b.ex", """
       defmodule B do
@@ -323,9 +400,32 @@ defmodule Mix.Tasks.Compile.ElixirTest do
       Mix.shell.flush
       purge [A, B]
 
+      File.write!("lib/a.ex", "\n# Hash buster comment", [:append])
+      Mix.Tasks.Compile.Elixir.run ["--verbose"]
+
+      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+      refute_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+    end
+  end
+
+  test "does not treat remote typespecs as compile time dependencies based on time" do
+    in_fixture "no_mixfile", fn ->
+      File.write!("lib/b.ex", """
+      defmodule B do
+        @type t :: A.t
+      end
+      """)
+
+      assert Mix.Tasks.Compile.Elixir.run(["--verbose","--large-resource-threshold","0"]) == :ok
+      assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
+      assert_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
+
+      Mix.shell.flush
+      purge [A, B]
+
       future = {{2020, 1, 1}, {0, 0, 0}}
       File.touch!("lib/a.ex", future)
-      Mix.Tasks.Compile.Elixir.run ["--verbose"]
+      Mix.Tasks.Compile.Elixir.run ["--verbose","--large-resource-threshold","0"]
 
       assert_received {:mix_shell, :info, ["Compiled lib/a.ex"]}
       refute_received {:mix_shell, :info, ["Compiled lib/b.ex"]}
